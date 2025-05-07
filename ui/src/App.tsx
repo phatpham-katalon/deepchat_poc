@@ -1,5 +1,5 @@
 import React from 'react';
-import { MCPChat } from './components/MCPChat';
+import MCPChat  from './components/MCPChat';
 import './App.css';
 
 function App() {

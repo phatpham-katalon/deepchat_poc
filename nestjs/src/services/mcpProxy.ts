@@ -1,31 +1,25 @@
 import { Injectable } from '@nestjs/common';
 import { experimental_createMCPClient, generateText } from 'ai';
-import { openai, createOpenAI } from '@ai-sdk/openai';
-import {openaiClient} from './openAI.config';
+import { openaiClient } from '../utils/openAI.config';
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js"
+type ToolName = string;
 
 @Injectable()
 export class MCPProxyService {
-  private readonly mcpServerUrl =
-    process.env.MCP_SERVER_URL ?? 'Not set mcp server';
-
-  /** Chat‑model with apiKey injected */
-  private readonly model = openaiClient
-
-  private mcpClient: any = null;
-  private readonly retryDelay = 1_000;
-  private readonly maxRetries = 3;
+  private readonly mcpServerUrl = process.env.MCP_SERVER_URL ?? '';
+  private readonly retryDelay   = 1_000;   // ms
+  private readonly maxRetries   = 3;
 
   private readonly systemPrompt = `
 You are a helpful assistant that can answer questions about Katalon.
 Always call search_katalon_knowledge_base first; cite the URI in your answer.`;
 
-  /* ---------- bootstrap ---------- */
+  private mcpClient: any = null;           // set by initClient()
+  private readonly model = openaiClient;   // GPT‑4o‑mini with apiKey
   constructor() {
-    void this.initClient(); // fire & forget
-  
+    void this.initClient();                
   }
 
-  /* ---------- utils ---------- */
   private wait(ms: number) {
     return new Promise((r) => setTimeout(r, ms));
   }
@@ -33,85 +27,81 @@ Always call search_katalon_knowledge_base first; cite the URI in your answer.`;
   private async initClient(retries = this.maxRetries): Promise<boolean> {
     try {
       this.mcpClient = await experimental_createMCPClient({
-        transport: { type: 'sse', url: this.mcpServerUrl },
+        transport: new StreamableHTTPClientTransport(new URL(this.mcpServerUrl)),
       });
-      const tools = await this.mcpClient.tools();
-      if (!tools || !Object.keys(tools).length) throw new Error('no tools');
+      await this.mcpClient.tools(); 
+      this.mcpClient.removeAllListeners?.('close');
+      this.mcpClient.on?.('close', async () => {
+        console.warn('MCP SSE closed – will reconnect on next request');
+        this.mcpClient = null;            
+      });
+
       return true;
     } catch (err) {
       if (retries) {
         await this.wait(this.retryDelay);
         return this.initClient(retries - 1);
       }
+      console.error('Init MCP failed:', err);
       this.mcpClient = null;
       return false;
     }
   }
 
-  /* ---------- public API ---------- */
-  async chat(text: string) {
-    try {
-      if (!text.trim()) return { text: 'Empty query', source: 'error' };
+  private async runWithTools(prompt: string): Promise<any> {
+    const tools = await this.mcpClient.tools();
+    const used: ToolName[] = [];
 
-      if (!this.mcpClient && !(await this.initClient()))
-        return { text: 'MCP offline', source: 'error' };
-
-      console.log('MCP client initialized successfully');
-      console.log('MCP server URL:', this.mcpServerUrl);
-      
-      try {
-        const tools = await this.mcpClient.tools();
-        console.log('Available tools:', Object.keys(tools));
-        const usedTools = [];
-        /* ---- generate reply ---- */
-        const { text: reply, usage } = await generateText({
-          model: this.model,
-          messages: [
-            { role: 'system', content: this.systemPrompt },
-            { role: 'user', content: text },
-          ],
-          tools,
-          /*  MUST be the exact object syntax – makes GPT wait for 2nd round  */
-          toolChoice: "auto",
-          maxSteps: 5, // ≥2 so GPT can read tool results
-          /* Optional debug */
-          onStepFinish({ finishReason, toolResults }) {
-            console.log('STEP', finishReason, toolResults?.[0]?.result);
-            // Theo dõi tool calls
-            if (toolResults && toolResults.length > 0) {
-              toolResults.forEach(result => {
-                if (result.toolName && !usedTools.includes(result.toolName)) {
-                  usedTools.push(result.toolName);
-                }
-              });
-            }
-          },
+    const { text } = await generateText({
+      model: this.model,
+      messages: [
+        { role: 'system', content: this.systemPrompt },
+        { role: 'user',   content: prompt },
+      ],
+      tools,
+      toolChoice: 'auto',
+      maxSteps: 5,
+      onStepFinish({ toolResults }) {
+        toolResults?.forEach(r => {
+          if (r.toolName && !used.includes(r.toolName)) used.push(r.toolName);
+          console.log('TOOL RESULT', r.toolName, r.result);
         });
+      },
+    });
 
-        
-        return {
-          text: reply,
-          source: usedTools.length > 0 ? 'from_mcp_verified' : 'from_model_only',
-          metadata: { 
-            usage, 
-            toolsUsed: usedTools // List of tools used had followed before
-          },
-        };
-      } catch (toolError) {
-        console.error('Error fetching tools or generating text:', toolError);
-        return { 
-          text: 'Error processing your request with tools. Please try again later.', 
-          source: 'error',
-          error: toolError.message 
-        };
+    return {
+      text,
+      source: used.length ? 'mcp_verified' : 'model_only',
+      metadata: { toolsUsed: used },
+    };
+  }
+
+  async chat(text: string) {
+    if (!text.trim()) return { text: 'Empty query', source: 'error' };
+
+    if (!this.mcpClient && !(await this.initClient()))
+      return { text: 'MCP offline', source: 'error' };
+
+    try {
+      return await this.runWithTools(text);
+    } catch (err: any) {
+      const transient =
+        err.code === 'ECONNRESET' ||
+        err.code === 'ERR_STREAM_WRITE_AFTER_END' ||
+        /socket|SSE closed/i.test(err.message);
+
+      if (transient) {
+        console.warn('MCP socket dead, recreating…');
+        if (await this.initClient()) {
+          try {
+            return await this.runWithTools(text); // retry once
+          } catch (inner) {
+            console.error('Retry failed:', inner);
+          }
+        }
       }
-    } catch (error) {
-      console.error('Chat error:', error);
-      return { 
-        text: 'An error occurred while processing your request. Please try again later.', 
-        source: 'error',
-        error: error.message 
-      };
+      console.error('Chat failed:', err);
+      return { text: 'Error processing request', source: 'error', error: err.message };
     }
   }
 }

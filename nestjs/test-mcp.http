@@ -1,7 +1,0 @@
-### Test MCP Chat
-POST http://localhost:8080/mcp-chat
-Content-Type: application/json
-
-{
-  "text": "Hello, how are you?"
-} 
