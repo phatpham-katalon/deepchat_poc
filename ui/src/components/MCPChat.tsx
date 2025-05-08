@@ -35,7 +35,15 @@ export default function MCPChat() {
     push({ role: 'user', text, timestamp: new Date().toISOString() });
     setLoading(true);
     try {
-      const { data } = await api.post('/mcp-chat', { text });
+      const { data } = await api.get('/mcp-chat', {
+        params: { text }, 
+        responseType: 'stream',
+        headers: {
+          Accept: 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Content-Type': 'text/event-stream',
+        },
+      });
       const aiMsg: HistMsg = {
         role: 'ai',
         text: data.text,
